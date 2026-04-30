@@ -11,10 +11,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
-COPY backend .
+COPY . .
 
 # Expose port 8080 (Cloud Run's default port)
 EXPOSE 8080
 
 # Command to run the application using Uvicorn
+# We use app:app because your filename is app.py and your FastAPI instance is named app
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
