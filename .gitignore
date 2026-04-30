@@ -4,3 +4,5 @@ pycache__/
 venv/
 .idea/
 .DS_Store
+.run/
+.run/Git-Repo.run.xml:10
