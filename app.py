@@ -1,9 +1,10 @@
 import os
-import requests
 import re
 import json
 import logging
 import time
+import asyncio
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -16,6 +17,7 @@ from google.genai import types
 # 1. SETUP & LOGGING CONFIGURATION
 # ==========================================
 
+# Issue 10: Richer Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("GitLeads-Advanced")
 
@@ -57,6 +59,10 @@ FALLBACK_DATA = {
     }
 }
 
+# Issue 5: Simple In-Memory Cache
+CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL = 300  # 5 minutes TTL
+
 
 # ==========================================
 # 2. DATA MODELS
@@ -80,54 +86,58 @@ class AgentInsight(BaseModel):
 
 
 # ==========================================
-# 3. GITHUB FETCHING & RATE LIMIT HANDLING
+# 3. GITHUB FETCHING (ASYNC & CACHED)
 # ==========================================
 
+# Issue 2: Regex extraction for stability
 def extract_org_name(github_input: str) -> str:
-    parts = github_input.strip().strip("/").split("/")
-    return parts[-1] if "github.com" in github_input else parts[0]
+    match = re.search(r"github\.com/([^/?]+)", github_input)
+    if match:
+        return match.group(1).strip()
+    return github_input.strip().strip("/")
 
 
-def github_request(url: str) -> requests.Response:
+# Issue 3, 4, 5: Async fetching with caching and robust rate-limit handling
+async def fetch_github_data_async(url: str, client: httpx.AsyncClient) -> Any:
+    # Check Cache
+    if url in CACHE and time.time() - CACHE[url]['timestamp'] < CACHE_TTL:
+        return CACHE[url]['data']
+
     headers = {"Accept": "application/vnd.github.v3+json"}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
 
     for attempt in range(3):
-        response = requests.get(url, headers=headers, timeout=10)
-        # Advanced Rate Limit Handling (Day 4 Requirement)
-        if response.status_code == 403 and "rate limit" in response.text.lower():
-            reset_time = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
-            sleep_time = max(reset_time - time.time(), 1)
-            logger.warning(f"Rate limited. Sleeping for {sleep_time} seconds.")
-            time.sleep(min(sleep_time, 5))
+        try:
+            response = await client.get(url, headers=headers, timeout=10.0)
+
+            # Rate limit handling for both 403 and 429
+            if response.status_code in (403, 429):
+                reset_time = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
+                sleep_time = max(reset_time - time.time(), 1)
+                logger.warning(f"Rate limited (Status {response.status_code}). Sleeping for {sleep_time} seconds.")
+                await asyncio.sleep(min(sleep_time, 5))
+                continue
+
+            if response.status_code == 200:
+                data = response.json()
+                CACHE[url] = {'data': data, 'timestamp': time.time()}
+                return data
+            return []  # Return empty on 404 or other errors to avoid crashing orchestration
+
+        except httpx.RequestError as e:
+            logger.error(f"HTTP Request error for {url}: {e}")
+            await asyncio.sleep(2)
             continue
-        return response
-    return response
 
-
-def fetch_top_repos(org: str, limit: int = 5) -> List[Dict]:
-    res = github_request(f"https://api.github.com/orgs/{org}/repos?sort=updated&per_page={limit}")
-    return res.json() if res.status_code == 200 else []
-
-
-def fetch_commits(org: str, repo: str, limit: int = 10) -> List[Dict]:
-    res = github_request(f"https://api.github.com/repos/{org}/{repo}/commits?per_page={limit}")
-    return res.json() if res.status_code == 200 else []
-
-
-def fetch_contributors(org: str, repo: str) -> set:
-    res = github_request(f"https://api.github.com/repos/{org}/{repo}/contributors?per_page=100")
-    if res.status_code == 200:
-        return {user.get("login") for user in res.json() if isinstance(user, dict) and user.get("login")}
-    return set()
+    return []
 
 
 # ==========================================
 # 4. SIGNAL FILTERING & PREPROCESSING
 # ==========================================
 
-def filter_and_score_signals(commits_data: list, user_keywords: list) -> Tuple[
+def filter_and_score_signals(commits_data: list, repos: list, user_keywords: list) -> Tuple[
     List[str], List[str], List[str], List[str], int]:
     user_matched_commits, default_matched_commits = [], []
     user_hits, default_hits = set(), set()
@@ -139,6 +149,16 @@ def filter_and_score_signals(commits_data: list, user_keywords: list) -> Tuple[
     noise_words = ["merge pull request", "update readme", "typo", "chore", "version packages", "bump", "lint",
                    "cleanup", "release", ".gitignore"]
 
+    # Issue 7: Keyword scoring may miss intent in repo names
+    for repo in repos:
+        repo_name = repo.get("name", "").lower()
+        for kw in cleaned_user_kws:
+            if re.search(rf"\b{re.escape(kw)}\b", repo_name):
+                user_hits.add(kw)
+        for kw in DEFAULT_KEYWORDS:
+            if re.search(rf"\b{re.escape(kw)}\b", repo_name):
+                default_hits.add(kw)
+
     for commit in commits_data:
         msg = commit.get("commit", {}).get("message", "").lower()
         if any(noise in msg for noise in noise_words):
@@ -147,7 +167,6 @@ def filter_and_score_signals(commits_data: list, user_keywords: list) -> Tuple[
         clean_msg = msg.split('\n')[0].strip()
         clean_msg = re.sub(r'\(#\d+\)', '', clean_msg).strip()
 
-        # Deduplication of commits (Day 5 Requirement)
         if clean_msg in seen_commits:
             continue
         seen_commits.add(clean_msg)
@@ -169,10 +188,9 @@ def filter_and_score_signals(commits_data: list, user_keywords: list) -> Tuple[
         elif matched_default and len(default_matched_commits) < 10:
             default_matched_commits.append(clean_msg)
 
-    # Simple algorithmic pre-scoring before AI (Day 5 Requirement)
     base_score = min(100, (len(user_hits) * 15) + (len(default_hits) * 5) + (len(user_matched_commits) * 10))
 
-    return user_matched_commits, default_matched_commits, list(user_hits), list(default_hits), base_score
+    return user_matched_commits, default_matched_commits, list(user_hits), list(default_hits), int(base_score)
 
 
 # ==========================================
@@ -183,7 +201,6 @@ def call_intent_agent(payload: dict) -> dict:
     if not VERTEX_AVAILABLE:
         return FALLBACK_DATA["agent_insight"]
 
-    # 1. FULL MASTER AI SYSTEM PROMPT (Restored verbatim + New Guardrails)
     system_instruction = """
     You are an expert B2B Sales Intelligence Analyst specializing in interpreting engineering activity as business buying signals.
 
@@ -303,29 +320,71 @@ def call_intent_agent(payload: dict) -> dict:
 # ==========================================
 
 @app.post("/api/analyze")
-def analyze_github_intent(request: AnalyzeRequest):
+async def analyze_github_intent(request: AnalyzeRequest):
+    start_time = time.time()
     org = extract_org_name(request.github_org)
-    logger.info(f"Starting analysis for org: {org}")
+
+    logger.info(f"Analysis started: {org}")
 
     try:
-        repos = fetch_top_repos(org, limit=5)
-        if not isinstance(repos, list):
-            repos = []
+        async with httpx.AsyncClient() as client:
+            repos_url = f"https://api.github.com/orgs/{org}/repos?sort=updated&per_page=5"
+            repos = await fetch_github_data_async(repos_url, client)
 
-        all_commits, unique_contributors, repo_names = [], set(), []
+            # Issue 8: Validation of org existence
+            if not repos:
+                logger.warning(f"GitHub organization not found or empty: {org}")
+                return {"status": "error", "message": "GitHub organization not found or has no public repositories"}
 
-        for repo in repos:
-            repo_name = repo.get("name")
-            if not repo_name: continue
-            repo_names.append(repo_name)
-            all_commits.extend(fetch_commits(org, repo_name, limit=10))
-            unique_contributors.update(fetch_contributors(org, repo_name))
+            all_commits = []
+            unique_contributors = set()
+            repo_names = []
 
-        u_commits, d_commits, u_hits, d_hits, algo_score = filter_and_score_signals(all_commits,
+            tasks = []
+            task_mapping = []
+
+            for repo in repos:
+                repo_name = repo.get("name")
+                if not repo_name: continue
+                repo_names.append(repo_name)
+
+                commits_url = f"https://api.github.com/repos/{org}/{repo_name}/commits?per_page=10"
+                contributors_url = f"https://api.github.com/repos/{org}/{repo_name}/contributors?per_page=100"
+
+                # Queue up concurrent tasks (Issue 3)
+                tasks.append(fetch_github_data_async(commits_url, client))
+                task_mapping.append(('commits', repo_name))
+
+                tasks.append(fetch_github_data_async(contributors_url, client))
+                task_mapping.append(('contributors', repo_name))
+
+            # Execute all network calls concurrently
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, res in enumerate(results):
+                if isinstance(res, Exception):
+                    logger.error(f"Error fetching async data: {res}")
+                    continue
+
+                task_type, _ = task_mapping[i]
+                if task_type == 'commits' and isinstance(res, list):
+                    all_commits.extend(res)
+                elif task_type == 'contributors' and isinstance(res, list):
+                    for user in res:
+                        if isinstance(user, dict) and user.get("login"):
+                            unique_contributors.add(user.get("login"))
+
+        u_commits, d_commits, u_hits, d_hits, algo_score = filter_and_score_signals(all_commits, repos,
                                                                                     request.custom_keywords)
 
-        count = len(unique_contributors)
-        activity_level = "High" if count > 15 else ("Medium" if count > 5 else "Low")
+        # Issue 6: More realistic contributor scoring
+        activity_score = len(unique_contributors) + (len(repo_names) * 2) + (len(all_commits) / 5)
+        if activity_score > 20:
+            activity_level = "High"
+        elif activity_score > 10:
+            activity_level = "Medium"
+        else:
+            activity_level = "Low"
 
         ai_payload = {
             "org": org,
@@ -340,23 +399,28 @@ def analyze_github_intent(request: AnalyzeRequest):
             "algorithmic_score": algo_score
         }
 
-        agent_insight = call_intent_agent(ai_payload)
+        # Prevent blocking the event loop on the synchronous AI call
+        agent_insight = await asyncio.to_thread(call_intent_agent, ai_payload)
 
-        logger.info(f"Analysis complete for org: {org}")
+        # Issue 10: Duration logging
+        duration = time.time() - start_time
+        logger.info(f"Analysis completed for {org} in {duration:.2f}s")
+
         return {
             "status": "success",
             "org_analyzed": org,
             "raw_metrics": {
                 "user_keywords_found": u_hits,
                 "default_keywords_found": d_hits,
-                "contributors_active": count,
+                "contributors_active": len(unique_contributors),
                 "pre_ai_algorithmic_score": algo_score
             },
             "agent_insight": agent_insight
         }
 
     except Exception as e:
-        logger.error(f"Extraction Error for {org}: {e}")
+        duration = time.time() - start_time
+        logger.error(f"Extraction Error for {org} after {duration:.2f}s: {e}")
         return FALLBACK_DATA
 
 
