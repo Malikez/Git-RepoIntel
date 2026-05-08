@@ -710,7 +710,7 @@ async def analyze_github_intent(request: AnalyzeRequest):
             # 15 repos × 5 endpoints = 75 requests, processed safely 12 at a time
             # by GITHUB_SEMAPHORE. The semaphore alone prevents connection storms —
             # reducing repo count further would only sacrifice AI grounding quality.
-            owned_repos = [r for r in repos_raw if not r.get("fork", False)][:15]
+            owned_repos = [r for r in repos_raw if not r.get("fork", False)][:20]
             logger.info(
                 f"[{org}] {len(repos_raw)} repos fetched, "
                 f"{len(owned_repos)} non-forks selected for analysis"
