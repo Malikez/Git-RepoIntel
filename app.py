@@ -190,6 +190,45 @@ def extract_org_name(github_input: str) -> str:
     return github_input.strip().strip("/")
 
 
+def validate_org_name(org: str) -> Optional[str]:
+    """
+    Fast local validation before any network call is made.
+    Returns an error message string if invalid, None if the name looks legitimate.
+
+    GitHub org name rules:
+      - 1 to 39 characters
+      - Only alphanumeric characters and single hyphens
+      - Cannot start or end with a hyphen
+      - Cannot be empty or purely whitespace
+    """
+    if not org or not org.strip():
+        return "No organisation name provided. Please enter a GitHub organisation name or URL."
+
+    # Too long — GitHub hard limit is 39 characters
+    if len(org) > 39:
+        return f"'{org}' is too long to be a valid GitHub organisation name (max 39 characters). Please check and try again."
+
+    # Contains characters GitHub never allows in org names
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$", org):
+        # Give a specific hint depending on what's wrong
+        if " " in org:
+            return f"'{org}' contains spaces. GitHub organisation names cannot contain spaces — did you mean '{org.replace(' ', '-')}'?"
+        if org.startswith("-") or org.endswith("-"):
+            return f"'{org}' starts or ends with a hyphen, which is not valid for a GitHub organisation name."
+        if re.search(r"[^a-zA-Z0-9\-]", org):
+            bad_chars = set(re.findall(r"[^a-zA-Z0-9\-]", org))
+            return (
+                f"'{org}' contains invalid characters: {bad_chars}. "
+                f"GitHub organisation names may only contain letters, numbers, and hyphens."
+            )
+
+    # Double hyphens are not allowed
+    if "--" in org:
+        return f"'{org}' contains consecutive hyphens, which GitHub does not allow in organisation names."
+
+    return None  # Passed all checks — safe to proceed
+
+
 # ── FIX 1 (continued): Replaced fetch function ───────────────────────────────
 # Changes from old version:
 #   1. Wrapped in GITHUB_SEMAPHORE — caps concurrency, prevents connection storms
@@ -254,6 +293,67 @@ async def fetch_github_data_async(url: str, client: httpx.AsyncClient) -> Any:
 
     logger.warning(f"All 3 attempts exhausted for {url}. Returning empty.")
     return []
+
+
+async def verify_org_exists(org: str, client: httpx.AsyncClient) -> Optional[str]:
+    """
+    Single lightweight ping to /orgs/{org} before any heavy data fetching.
+    Returns an error message string if the org cannot be found or accessed,
+    or None if the org is confirmed to exist.
+
+    This runs BEFORE the 75-request concurrent batch so that a typo in the
+    org name fails immediately — in under 1 second — with a clear message,
+    rather than silently failing halfway through data collection.
+    """
+    url = f"https://api.github.com/orgs/{org}"
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+
+    try:
+        response = await asyncio.wait_for(
+            client.get(url, headers=headers),
+            timeout=8.0,
+        )
+
+        if response.status_code == 200:
+            return None  # Org confirmed — proceed with full analysis
+
+        if response.status_code == 404:
+            return (
+                f"Organisation '{org}' was not found on GitHub. "
+                f"Please check the name or URL and try again."
+            )
+
+        if response.status_code == 403:
+            return (
+                f"Access to '{org}' was denied by GitHub (403). "
+                f"The organisation may be private, or your API token may lack permissions."
+            )
+
+        if response.status_code == 451:
+            return (
+                f"Organisation '{org}' is unavailable for legal reasons (GitHub 451). "
+                f"It may have been suspended or removed."
+            )
+
+        # Any other non-200 — surface it clearly
+        return (
+            f"GitHub returned an unexpected status ({response.status_code}) "
+            f"when looking up '{org}'. Please try again shortly."
+        )
+
+    except asyncio.TimeoutError:
+        return (
+            f"GitHub did not respond in time when looking up '{org}'. "
+            f"Please check your connection and try again."
+        )
+
+    except httpx.RequestError as e:
+        return (
+            f"A network error occurred while looking up '{org}': {type(e).__name__}. "
+            f"Please check your connection and try again."
+        )
 
 
 # ==========================================
@@ -685,8 +785,38 @@ async def analyze_github_intent(request: AnalyzeRequest):
     org = extract_org_name(request.github_org)
     logger.info(f"[{org}] Analysis started")
 
+    # ── Guard 1: Local format validation (zero network cost) ──────────────────
+    # Catches typos, spaces, special characters, and impossible names instantly
+    # before any API call is attempted. Returns in milliseconds.
+    format_error = validate_org_name(org)
+    if format_error:
+        logger.warning(f"[{org}] Input validation failed: {format_error}")
+        return {
+            "status": "error",
+            "org_analyzed": org,
+            "message": format_error,
+            "agent_insight": None,
+        }
+
     try:
         async with httpx.AsyncClient() as client:
+
+            # ── Guard 2: Org existence ping (single lightweight API call) ──────
+            # Hits /orgs/{org} — a fast read-only endpoint that confirms the org
+            # exists BEFORE we fire the full 75-request concurrent batch.
+            # If the org is not found, this returns an error in under 1 second.
+            # Without this guard, a wrong org name would silently fail halfway
+            # through data collection with an empty result and no clear message.
+            logger.info(f"[{org}] Verifying org existence...")
+            existence_error = await verify_org_exists(org, client)
+            if existence_error:
+                logger.warning(f"[{org}] Org verification failed: {existence_error}")
+                return {
+                    "status": "error",
+                    "org_analyzed": org,
+                    "message": existence_error,
+                    "agent_insight": None,
+                }
 
             # ── Step 1: Fetch org repos ────────────────────────────────────────
             # Fetch top 20 by last-updated, then keep the 15 most relevant non-forks.
@@ -710,7 +840,7 @@ async def analyze_github_intent(request: AnalyzeRequest):
             # 15 repos × 5 endpoints = 75 requests, processed safely 12 at a time
             # by GITHUB_SEMAPHORE. The semaphore alone prevents connection storms —
             # reducing repo count further would only sacrifice AI grounding quality.
-            owned_repos = [r for r in repos_raw if not r.get("fork", False)][:20]
+            owned_repos = [r for r in repos_raw if not r.get("fork", False)][:15]
             logger.info(
                 f"[{org}] {len(repos_raw)} repos fetched, "
                 f"{len(owned_repos)} non-forks selected for analysis"
